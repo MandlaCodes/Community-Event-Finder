@@ -1,0 +1,17 @@
+[
+    {
+      "id": "1",
+      "title": "Free Yoga in the Park",
+      "date": "2025-09-20",
+      "location": "Johannesburg Central Park",
+      "description": "Join a free community yoga session. Bring your mat!"
+    },
+    {
+      "id": "2",
+      "title": "Local Art Exhibit",
+      "date": "2025-09-22",
+      "location": "Community Art Center",
+      "description": "Explore local artists' work. Free entry for all."
+    }
+  ]
+  
