@@ -200,8 +200,8 @@ geocode_cache = {}
 geocode_lock = asyncio.Lock()
 
 # Ticketmaster API page sizes and offsets are limited.
-MAX_EVENT_PAGES = 8
-DEFAULT_EVENT_PAGES = 5
+MAX_EVENT_PAGES = 10
+DEFAULT_EVENT_PAGES = 10
 DEFAULT_PAGE_SIZE = 100
 
 
@@ -539,262 +539,207 @@ def group_duplicate_events(events):
 # TICKETMASTER FETCHING
 # ============================================================
 
-async def fetch_ticketmaster_page(
-    base_params,
-    page,
-):
+async def fetch_ticketmaster_page(base_params, page):
     try:
         response = await client.get(
             TICKETMASTER_URL,
-            params={
-                **base_params,
-                "page": page,
-            },
+            params={**base_params, "page": page},
         )
-
         response.raise_for_status()
-
         data = response.json()
-
-        events = (
-            data.get("_embedded") or {}
-        ).get("events") or []
-
         page_info = data.get("page") or {}
-
         return {
-            "items": events,
-            "totalPages": page_info.get(
-                "totalPages"
-            ),
-            "totalElements": page_info.get(
-                "totalElements"
-            ),
+            "items": (data.get("_embedded") or {}).get("events") or [],
+            "totalPages": page_info.get("totalPages"),
+            "totalElements": page_info.get("totalElements"),
         }
-
-    except (
-        httpx.HTTPError,
-        ValueError,
-    ) as exc:
-        logger.warning(
-            "Ticketmaster page %s failed: %s",
-            page,
-            exc,
-        )
-
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Ticketmaster page %s failed: %s", page, exc)
         return None
 
 
-# ============================================================
-# EVENTS API
-# ============================================================
+# Avoid repeated requests for identical searches from the mobile app.
+EVENT_CACHE_SECONDS = 300
+EVENT_CACHE = {}
+EVENT_CACHE_LOCK = asyncio.Lock()
+
+# Country codes for the known South African locations. Other cities can
+# still be searched without a country code if the user hasn't provided one.
+SA_CITIES = {
+    "johannesburg", "joburg", "jozi", "sandton", "randburg",
+    "roodepoort", "soweto", "midrand", "pretoria", "tshwane",
+    "cape town", "durban", "gqeberha", "port elizabeth",
+    "bloemfontein",
+}
+
+# Ticketmaster's Discovery API permits a limited deep-pagination window.
+# Use the largest supported page size and fetch all pages in that window.
+TICKETMASTER_WINDOW = 1000
+
+
+async def fetch_search_strategy(label, params, max_pages, size):
+    first = await fetch_ticketmaster_page(params, 0)
+    if first is None:
+        return {
+            "name": label,
+            "items": [],
+            "totalElements": None,
+            "pagesFetched": 0,
+            "partial": True,
+            "failed": True,
+        }
+
+    advertised = first.get("totalPages")
+    if isinstance(advertised, int):
+        count = min(max_pages, max(1, advertised))
+    else:
+        count = max_pages
+    count = min(count, max(1, TICKETMASTER_WINDOW // size))
+
+    remaining = []
+    if count > 1:
+        remaining = await asyncio.gather(*[
+            fetch_ticketmaster_page(params, page)
+            for page in range(1, count)
+        ])
+
+    results = [first, *remaining]
+    items = [
+        event
+        for result in results if result is not None
+        for event in result["items"]
+    ]
+    return {
+        "name": label,
+        "items": items,
+        "totalElements": first.get("totalElements"),
+        "pagesFetched": sum(result is not None for result in results),
+        "partial": any(result is None for result in results)
+            or (isinstance(advertised, int) and advertised > count),
+        "failed": False,
+    }
+
 
 @app.get("/api/events")
 async def events(
-    city: str = Query(
-        "Johannesburg",
-        min_length=1,
-        max_length=100,
-    ),
-    country: str = Query(
-        "",
-        max_length=2,
-    ),
+    city: str = Query("Johannesburg", min_length=1, max_length=100),
+    country: str = Query("", max_length=2),
     category: str = "all",
-    keyword: str = Query(
-        "",
-        max_length=100,
-    ),
-    pages: int = Query(
-        DEFAULT_EVENT_PAGES,
-        ge=1,
-        le=MAX_EVENT_PAGES,
-    ),
-    size: int = Query(
-        DEFAULT_PAGE_SIZE,
-        ge=1,
-        le=100,
-    ),
+    keyword: str = Query("", max_length=100),
+    pages: int = Query(DEFAULT_EVENT_PAGES, ge=1, le=MAX_EVENT_PAGES),
+    size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=100),
 ):
     if not settings.ticketmaster_api_key:
-        raise HTTPException(
-            503,
-            "Ticketmaster is not configured",
-        )
+        raise HTTPException(503, "Ticketmaster is not configured")
 
     city = clean_text(city)
     country = country.strip().upper()
     category = category.strip().lower()
     keyword = clean_text(keyword)
 
-    location_params, search_mode = (
-        await search_location(city, country)
-    )
+    # This prevents a South African city query from unintentionally
+    # matching an identically named city in another country.
+    effective_country = country or ("ZA" if city_key(city) in SA_CITIES else "")
+    location_params, location_mode = await search_location(city, effective_country)
 
-    base = {
+    common = {
         "apikey": settings.ticketmaster_api_key,
         "size": size,
         "sort": "date,asc",
-        **location_params,
     }
-
-    if country:
-        base["countryCode"] = country
-
+    if effective_country:
+        common["countryCode"] = effective_country
     if category in CATEGORY_SEGMENTS:
-        base["segmentId"] = (
-            CATEGORY_SEGMENTS[category]
-        )
-
+        common["segmentId"] = CATEGORY_SEGMENTS[category]
     if keyword:
-        base["keyword"] = keyword
-
+        common["keyword"] = keyword
     elif category in CATEGORY_TERMS:
-        base["keyword"] = (
-            CATEGORY_TERMS[category]
-        )
+        common["keyword"] = CATEGORY_TERMS[category]
 
-    logger.info(
-        "Event discovery city=%s country=%s "
-        "category=%s mode=%s pages=%s",
-        city,
-        country,
-        category,
-        search_mode,
-        pages,
-    )
+    # Union of two independent Discovery searches: the requested city
+    # AND the metropolitan radius. A city-filtered event may have no
+    # coordinates; a radius-filtered event may use a suburb city name.
+    strategies = [("city", {**common, "city": city})]
+    if location_mode == "radius":
+        strategies.append(("radius", {**common, **location_params}))
 
-    # Fetch the first page to determine the number
-    # of pages Ticketmaster actually has.
+    cache_key = (city_key(city), effective_country, category, keyword.casefold(), pages, size)
+    now = time.monotonic()
+    cached = EVENT_CACHE.get(cache_key)
+    if cached and cached[0] > now:
+        return cached[1]
 
-    first_page = await fetch_ticketmaster_page(
-        base,
-        0,
-    )
+    async with EVENT_CACHE_LOCK:
+        cached = EVENT_CACHE.get(cache_key)
+        if cached and cached[0] > time.monotonic():
+            return cached[1]
 
-    if first_page is None:
-        raise HTTPException(
-            502,
-            "Event provider temporarily unavailable",
-        )
+        searches = await asyncio.gather(*[
+            fetch_search_strategy(name, params, MAX_EVENT_PAGES, size)
+            for name, params in strategies
+        ])
+        if all(search["failed"] for search in searches):
+            raise HTTPException(502, "Ticketmaster searches are temporarily unavailable")
 
-    total_pages = first_page.get("totalPages")
+        # IDs are the authoritative way to eliminate identical listings
+        # returned by both strategies.
+        by_id = {}
+        for search in searches:
+            for item in search["items"]:
+                event_id = item.get("id")
+                if event_id:
+                    by_id.setdefault(str(event_id), item)
 
-    if isinstance(total_pages, int):
-        page_count = min(
-            pages,
-            max(total_pages, 1),
-        )
-    else:
-        page_count = pages
-
-    # Ticketmaster's deep pagination is limited.
-    # Stay within the usual 1,000-result window.
-    page_count = min(
-        page_count,
-        max(1, 1000 // size),
-    )
-
-    results = [first_page]
-
-    if page_count > 1:
-        remaining = await asyncio.gather(
-            *[
-                fetch_ticketmaster_page(
-                    base,
-                    page_number,
-                )
-                for page_number in range(
-                    1,
-                    page_count,
-                )
-            ]
-        )
-
-        results.extend(remaining)
-
-    # Remove duplicate provider IDs first.
-
-    seen_ids = set()
-    normalized = []
-
-    for result in results:
-        if not result:
-            continue
-
-        for item in result.get("items") or []:
-            event_id = item.get("id")
-
-            if not event_id:
-                continue
-
-            if event_id in seen_ids:
-                continue
-
-            seen_ids.add(event_id)
-
+        normalized = []
+        for item in by_id.values():
             try:
-                normalized.append(
-                    event_record(item)
-                )
-            except (
-                ValueError,
-                TypeError,
-                KeyError,
-            ) as exc:
-                logger.warning(
-                    "Skipping invalid event: %s",
-                    exc,
-                )
+                normalized.append(event_record(item))
+            except (ValueError, TypeError, KeyError) as exc:
+                logger.warning("Skipping invalid Ticketmaster event: %s", exc)
 
-    # Group repeated performances at the same venue.
+        unique_events = group_duplicate_events(normalized)
+        partial = any(search["partial"] for search in searches)
+        stats = [
+            {
+                "strategy": search["name"],
+                "providerTotalElements": search["totalElements"],
+                "recordsFetched": len(search["items"]),
+                "pagesFetched": search["pagesFetched"],
+                "partial": search["partial"],
+            }
+            for search in searches
+        ]
 
-    unique_events = group_duplicate_events(
-        normalized
-    )
-
-    duplicates_removed = (
-        len(normalized) - len(unique_events)
-    )
-
-    partial = any(
-        result is None
-        for result in results
-    )
-
-    logger.info(
-        "Discovery complete city=%s "
-        "performances=%s unique=%s grouped=%s",
-        city,
-        len(normalized),
-        len(unique_events),
-        duplicates_removed,
-    )
-
-    return {
-        "items": unique_events,
-        "count": len(unique_events),
-        "source": "ticketmaster",
-        "partial": partial,
-        "city": city,
-        "country": country,
-        "searchMode": search_mode,
-        "radiusKm": (
-            location_params.get("radius")
-            if search_mode == "radius"
-            else None
-        ),
-        "totalPerformances": len(normalized),
-        "duplicatesRemoved": duplicates_removed,
-        "providerTotalElements": (
-            first_page.get("totalElements")
-        ),
-        "pagesFetched": sum(
-            1
-            for result in results
-            if result is not None
-        ),
-    }
+        result = {
+            "items": unique_events,
+            "count": len(unique_events),
+            "source": "ticketmaster",
+            "partial": partial,
+            "city": city,
+            "country": effective_country,
+            "searchMode": "radius" if len(strategies) > 1 else "city",
+            "searchStrategies": [name for name, _ in strategies],
+            "radiusKm": location_params.get("radius") if location_mode == "radius" else None,
+            "totalPerformances": len(normalized),
+            "duplicatesRemoved": len(normalized) - len(unique_events),
+            "providerTotalElements": sum(
+                search["totalElements"] or 0 for search in searches
+            ),
+            "pagesFetched": sum(search["pagesFetched"] for search in searches),
+            "searches": stats,
+            "apiCoverageGuaranteed": False,
+        }
+        logger.info(
+            "Ticketmaster combined city=%s country=%s raw=%s unique=%s searches=%s",
+            city, effective_country, len(normalized), len(unique_events), stats,
+        )
+        EVENT_CACHE[cache_key] = (time.monotonic() + EVENT_CACHE_SECONDS, result)
+        # Prevent unbounded cache growth on long-lived servers.
+        if len(EVENT_CACHE) > 150:
+            for key in list(EVENT_CACHE):
+                if EVENT_CACHE[key][0] <= time.monotonic():
+                    del EVENT_CACHE[key]
+        return result
 
 
 # ============================================================
