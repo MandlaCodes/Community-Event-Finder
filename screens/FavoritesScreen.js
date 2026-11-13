@@ -25,6 +25,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+import { apiImage } from '../lib/communityApi';
+
 const C = {
   bg: '#09090E',
   card: '#191920',
@@ -38,35 +40,78 @@ const C = {
 
 const FAVORITES_KEY = 'favorites';
 
-const getImage = (event) =>
-  event?.image ||
-  event?.imageUrl ||
-  event?.images?.[0]?.url ||
-  event?._embedded?.attractions?.[0]?.images?.[0]?.url ||
-  null;
+const fallback = require('../assets/pexels-apasaric-2078008.jpg');
 
-const getTitle = (event) =>
-  event?.title || event?.name || 'Untitled event';
+// --------------------------------------------------
+// EVENT HELPERS
+// --------------------------------------------------
+
+function getImage(event) {
+  const candidates = [
+    event?.image,
+    event?.imageUrl,
+    event?.image_url,
+    event?.images,
+    event?.thumbnail,
+    event?._embedded?.attractions?.[0]?.images,
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+
+    const url = apiImage(candidate);
+
+    if (url) return url;
+  }
+
+  return null;
+}
+
+function getTitle(event) {
+  return event?.title || event?.name || 'Untitled event';
+}
+
+function getRawDate(event) {
+  return (
+    event?.rawDate ||
+    event?.dates?.start?.localDate ||
+    null
+  );
+}
+
+function getRawTime(event) {
+  return (
+    event?.rawTime ||
+    event?.dates?.start?.localTime ||
+    null
+  );
+}
 
 function getDate(event) {
-  if (event?.date) return event.date;
+  const rawDate = getRawDate(event);
 
-  const rawDate =
-    event?.rawDate ||
-    event?.dates?.start?.localDate;
-
-  if (!rawDate) return 'Date to be announced';
+  if (!rawDate) {
+    return event?.date || 'Date to be announced';
+  }
 
   const date = new Date(`${rawDate}T12:00:00`);
 
-  if (Number.isNaN(date.getTime())) return rawDate;
+  if (Number.isNaN(date.getTime())) {
+    return String(rawDate);
+  }
 
-  return date.toLocaleDateString('en-ZA', {
+  const formatted = date.toLocaleDateString('en-ZA', {
     weekday: 'short',
     day: 'numeric',
     month: 'short',
     year: 'numeric',
   });
+
+  const time = getRawTime(event);
+
+  return time
+    ? `${formatted} · ${String(time).slice(0, 5)}`
+    : formatted;
 }
 
 function getVenue(event) {
@@ -77,16 +122,136 @@ function getVenue(event) {
   );
 }
 
+function getCity(event) {
+  return (
+    event?.city ||
+    event?._embedded?.venues?.[0]?.city?.name ||
+    ''
+  );
+}
+
+function normalizeText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function eventGroupKey(event) {
+  const title = normalizeText(getTitle(event));
+  const venue = normalizeText(getVenue(event));
+  const city = normalizeText(getCity(event));
+
+  return `${title}|${venue}|${city}`;
+}
+
+function eventTimestamp(event) {
+  const date = getRawDate(event);
+
+  if (!date) {
+    return '9999-12-31T23:59:59';
+  }
+
+  return `${date}T${getRawTime(event) || '00:00:00'}`;
+}
+
+function eventId(event) {
+  return `${event?.kind || 'event'}:${String(event?.id || '')}`;
+}
+
+// --------------------------------------------------
+// GROUP DUPLICATE SAVED EVENTS
+// --------------------------------------------------
+
+function groupSavedEvents(events) {
+  const groups = new Map();
+
+  for (const event of events) {
+    if (!event || typeof event !== 'object') {
+      continue;
+    }
+
+    const key = eventGroupKey(event);
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        ...event,
+        image: getImage(event),
+        savedPerformanceCount: 1,
+      });
+
+      continue;
+    }
+
+    const existing = groups.get(key);
+
+    const earlier =
+      eventTimestamp(event) <
+      eventTimestamp(existing);
+
+    const preferred = earlier
+      ? event
+      : existing;
+
+    const other = earlier
+      ? existing
+      : event;
+
+    groups.set(key, {
+      ...preferred,
+
+      image:
+        getImage(preferred) ||
+        getImage(other) ||
+        null,
+
+      description:
+        preferred.description ||
+        other.description ||
+        '',
+
+      url:
+        preferred.url ||
+        other.url ||
+        null,
+
+      savedPerformanceCount:
+        existing.savedPerformanceCount + 1,
+    });
+  }
+
+  return Array.from(groups.values()).sort(
+    (a, b) =>
+      eventTimestamp(a).localeCompare(
+        eventTimestamp(b)
+      )
+  );
+}
+
+// --------------------------------------------------
+// SAVED EVENT CARD
+// --------------------------------------------------
+
 function SavedCard({
   event,
   navigation,
   onRemove,
   index,
 }) {
-  const image = getImage(event);
+  const imageUrl = getImage(event);
+
+  const [imageFailed, setImageFailed] = useState(false);
 
   const fade = useRef(new Animated.Value(0)).current;
   const translate = useRef(new Animated.Value(18)).current;
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [imageUrl]);
 
   useEffect(() => {
     const animation = Animated.parallel([
@@ -110,6 +275,8 @@ function SavedCard({
     return () => animation.stop();
   }, [fade, translate, index]);
 
+  const showRemote = !!imageUrl && !imageFailed;
+
   return (
     <Animated.View
       style={{
@@ -120,27 +287,35 @@ function SavedCard({
       <Pressable
         style={s.eventCard}
         onPress={() =>
-          navigation.navigate('EventDetail', { event })
+          navigation.navigate('EventDetail', {
+            event,
+          })
         }
         accessibilityRole="button"
         accessibilityLabel={`View ${getTitle(event)}`}
       >
         <View style={s.imageContainer}>
-          {image ? (
-            <Image
-              source={{ uri: image }}
-              style={StyleSheet.absoluteFillObject}
-              resizeMode="cover"
-            />
-          ) : (
-            <View style={s.imageFallback}>
-              <Ionicons
-                name="images-outline"
-                size={34}
-                color={C.muted}
-              />
-            </View>
-          )}
+          <Image
+            source={
+              showRemote
+                ? { uri: imageUrl }
+                : fallback
+            }
+            style={s.eventImage}
+            resizeMode="cover"
+            onError={(error) => {
+              if (showRemote) {
+                console.warn(
+                  '[Community] Saved image failed:',
+                  getTitle(event),
+                  imageUrl,
+                  error?.nativeEvent?.error
+                );
+
+                setImageFailed(true);
+              }
+            }}
+          />
 
           <LinearGradient
             colors={[
@@ -167,7 +342,10 @@ function SavedCard({
 
           <Pressable
             style={s.heartButton}
-            onPress={() => onRemove(event)}
+            onPress={(pressEvent) => {
+              pressEvent.stopPropagation();
+              onRemove(event);
+            }}
             accessibilityRole="button"
             accessibilityLabel={`Remove ${getTitle(event)} from saved events`}
             hitSlop={8}
@@ -195,6 +373,21 @@ function SavedCard({
             {getTitle(event)}
           </Text>
 
+          {event.savedPerformanceCount > 1 ||
+          event.performanceCount > 1 ? (
+            <View style={s.performanceRow}>
+              <Ionicons
+                name="calendar-outline"
+                size={15}
+                color={C.purple}
+              />
+
+              <Text style={s.performanceText}>
+                Multiple performances available
+              </Text>
+            </View>
+          ) : null}
+
           <View style={s.locationRow}>
             <Ionicons
               name="location-outline"
@@ -206,7 +399,7 @@ function SavedCard({
               style={s.eventVenue}
               numberOfLines={1}
             >
-              {[getVenue(event), event.city]
+              {[getVenue(event), getCity(event)]
                 .filter(Boolean)
                 .join(' · ')}
             </Text>
@@ -231,6 +424,10 @@ function SavedCard({
   );
 }
 
+// --------------------------------------------------
+// FAVORITES SCREEN
+// --------------------------------------------------
+
 export default function FavoritesScreen({ navigation }) {
   const insets = useSafeAreaInsets();
 
@@ -240,27 +437,40 @@ export default function FavoritesScreen({ navigation }) {
 
   const mounted = useRef(true);
   const mutationQueue = useRef(Promise.resolve());
+  const favoritesRef = useRef([]);
+
+  // --------------------------------------------------
+  // LOAD FAVORITES
+  // --------------------------------------------------
 
   const loadFavorites = useCallback(async () => {
     try {
-      // Wait for any pending save/remove operation.
       await mutationQueue.current;
 
       const value = await AsyncStorage.getItem(
         FAVORITES_KEY
       );
 
-      const parsed = value ? JSON.parse(value) : [];
+      const parsed = value
+        ? JSON.parse(value)
+        : [];
+
+      const list = Array.isArray(parsed)
+        ? parsed
+        : [];
 
       if (mounted.current) {
-        setFavorites(
-          Array.isArray(parsed) ? parsed : []
-        );
+        favoritesRef.current = list;
+        setFavorites(list);
       }
     } catch (error) {
-      console.error('Unable to load favorites:', error);
+      console.error(
+        '[Community] Unable to load favorites:',
+        error
+      );
 
       if (mounted.current) {
+        favoritesRef.current = [];
         setFavorites([]);
       }
     } finally {
@@ -285,66 +495,80 @@ export default function FavoritesScreen({ navigation }) {
     }, [loadFavorites])
   );
 
-  const removeFavorite = useCallback(
-    (event) => {
-      const previous = favorites;
+  // --------------------------------------------------
+  // REMOVE SAVED EVENT
+  // --------------------------------------------------
 
-      const updated = favorites.filter(
-        (item) =>
-          String(item.id) !== String(event.id)
-      );
+  const removeFavorite = useCallback((event) => {
+    const key = eventGroupKey(event);
 
-      setFavorites(updated);
+    const previous = favoritesRef.current;
 
-      // Serialize writes to avoid overlapping removals.
-      const operation = mutationQueue.current
-        .catch(() => {})
-        .then(async () => {
-          const stored = await AsyncStorage.getItem(
-            FAVORITES_KEY
+    const updated = previous.filter(
+      (item) => eventGroupKey(item) !== key
+    );
+
+    favoritesRef.current = updated;
+    setFavorites(updated);
+
+    const operation = mutationQueue.current
+      .catch(() => {})
+      .then(async () => {
+        const stored = await AsyncStorage.getItem(
+          FAVORITES_KEY
+        );
+
+        const parsed = stored
+          ? JSON.parse(stored)
+          : [];
+
+        const current = Array.isArray(parsed)
+          ? parsed
+          : [];
+
+        const next = current.filter(
+          (item) => eventGroupKey(item) !== key
+        );
+
+        await AsyncStorage.setItem(
+          FAVORITES_KEY,
+          JSON.stringify(next)
+        );
+      });
+
+    mutationQueue.current = operation.catch(
+      (error) => {
+        console.error(
+          '[Community] Remove favorite failed:',
+          error
+        );
+
+        if (mounted.current) {
+          Alert.alert(
+            'Unable to remove event',
+            'Please try again.'
           );
 
-          const parsed = stored
-            ? JSON.parse(stored)
-            : [];
-
-          const current = Array.isArray(parsed)
-            ? parsed
-            : [];
-
-          const next = current.filter(
-            (item) =>
-              String(item.id) !== String(event.id)
-          );
-
-          await AsyncStorage.setItem(
-            FAVORITES_KEY,
-            JSON.stringify(next)
-          );
-        });
-
-      mutationQueue.current = operation.catch(
-        (error) => {
-          console.error('Remove favorite failed:', error);
-
-          if (mounted.current) {
-            setFavorites(previous);
-
-            Alert.alert(
-              'Unable to remove event',
-              'Please try again.'
-            );
-          }
+          loadFavorites();
         }
-      );
-    },
-    [favorites]
-  );
+      }
+    );
+  }, [loadFavorites]);
+
+  // --------------------------------------------------
+  // REFRESH
+  // --------------------------------------------------
 
   const refresh = () => {
     setRefreshing(true);
     loadFavorites();
   };
+
+  const uniqueFavorites = groupSavedEvents(favorites);
+
+  // --------------------------------------------------
+  // HEADER
+  // --------------------------------------------------
 
   const renderHeader = () => (
     <View style={s.header}>
@@ -373,7 +597,7 @@ export default function FavoritesScreen({ navigation }) {
         Keep the experiences you love in one place.
       </Text>
 
-      {!loading && favorites.length > 0 && (
+      {!loading && uniqueFavorites.length > 0 && (
         <View style={s.countRow}>
           <View style={s.countBadge}>
             <Ionicons
@@ -383,8 +607,8 @@ export default function FavoritesScreen({ navigation }) {
             />
 
             <Text style={s.countText}>
-              {favorites.length}{' '}
-              {favorites.length === 1
+              {uniqueFavorites.length}{' '}
+              {uniqueFavorites.length === 1
                 ? 'saved event'
                 : 'saved events'}
             </Text>
@@ -393,6 +617,10 @@ export default function FavoritesScreen({ navigation }) {
       )}
     </View>
   );
+
+  // --------------------------------------------------
+  // EMPTY STATE
+  // --------------------------------------------------
 
   const renderEmpty = () => {
     if (loading) {
@@ -445,13 +673,15 @@ export default function FavoritesScreen({ navigation }) {
     );
   };
 
+  // --------------------------------------------------
+  // MAIN SCREEN
+  // --------------------------------------------------
+
   return (
     <View style={s.container}>
       <FlatList
-        data={loading ? [] : favorites}
-        keyExtractor={(item, index) =>
-          String(item.id ?? index)
-        }
+        data={loading ? [] : uniqueFavorites}
+        keyExtractor={(item) => eventGroupKey(item)}
         renderItem={({ item, index }) => (
           <SavedCard
             event={item}
@@ -483,6 +713,10 @@ export default function FavoritesScreen({ navigation }) {
     </View>
   );
 }
+
+// --------------------------------------------------
+// STYLES
+// --------------------------------------------------
 
 const s = StyleSheet.create({
   container: {
@@ -570,10 +804,9 @@ const s = StyleSheet.create({
     backgroundColor: C.surface,
   },
 
-  imageFallback: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
+  eventImage: {
+    width: '100%',
+    height: '100%',
   },
 
   savedBadge: {
@@ -627,6 +860,19 @@ const s = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: -0.4,
     lineHeight: 26,
+  },
+
+  performanceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    marginTop: 11,
+  },
+
+  performanceText: {
+    color: '#D3A6FF',
+    fontSize: 12,
+    fontWeight: '600',
   },
 
   locationRow: {

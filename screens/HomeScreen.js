@@ -1,6 +1,7 @@
 
 import React, {
   useState,
+  useEffect,
   useCallback,
   useMemo,
   useRef,
@@ -51,8 +52,8 @@ const SCREEN_WIDTH = Dimensions.get('window').width;
 const CARD_WIDTH = Math.min(SCREEN_WIDTH * 0.76, 330);
 const CACHE_MS = 5 * 60 * 1000;
 
-// Enable when your backend has a working places provider.
-const PLACES_ENABLED = false;
+const PLACES_ENABLED =
+  process.env.EXPO_PUBLIC_ENABLE_PLACES === 'true';
 
 const moods = [
   {
@@ -117,82 +118,58 @@ function formatDate(item) {
 
   if (!time) return formatted;
 
-  const match = String(time).match(/^(\d{2}):(\d{2})/);
+  const match = String(time).match(
+    /^(\d{2}):(\d{2})/
+  );
 
   if (!match) return formatted;
 
   const hours = Number(match[1]);
   const minutes = match[2];
-
   const period = hours >= 12 ? 'PM' : 'AM';
   const displayHour = hours % 12 || 12;
 
   return `${formatted} · ${displayHour}:${minutes} ${period}`;
 }
 
-function normalizeImage(value) {
-  if (!value) return null;
-
-  if (Array.isArray(value)) {
-    const images = value
-      .map((entry) => {
-        if (typeof entry === 'string') {
-          return { url: entry, width: 0 };
-        }
-
-        return {
-          url: entry?.url || entry?.uri || entry?.src,
-          width: Number(entry?.width) || 0,
-        };
-      })
-      .filter((entry) => entry.url);
-
-    images.sort((a, b) => b.width - a.width);
-
-    return normalizeImage(images[0]?.url);
-  }
-
-  if (typeof value === 'object') {
-    return normalizeImage(
-      value.url || value.uri || value.src
-    );
-  }
-
-  if (typeof value !== 'string') return null;
-
-  const url = value.trim();
-
-  if (!/^https?:\/\//i.test(url)) return null;
-
-  return url;
-}
-
 function getImageUrl(item) {
+  if (!item) return null;
+
   const candidates = [
-    item?.image,
-    item?.imageUrl,
-    item?.image_url,
-    item?.images,
-    item?.thumbnail,
-    item?.photo,
+    item.image,
+    item.imageUrl,
+    item.image_url,
+    item.images,
+    item.thumbnail,
+    item.photo,
   ];
 
   for (const candidate of candidates) {
-    const direct = normalizeImage(candidate);
-
-    if (direct) return direct;
+    if (!candidate) continue;
 
     try {
-      const transformed = apiImage(candidate);
-      const normalized = normalizeImage(transformed);
+      const url = apiImage(candidate);
 
-      if (normalized) return normalized;
-    } catch {
-      // Try the next image source.
+      if (
+        typeof url === 'string' &&
+        /^https?:\/\//i.test(url)
+      ) {
+        return url;
+      }
+    } catch (error) {
+      console.warn(
+        '[Community] Invalid image:',
+        item.title,
+        error?.message
+      );
     }
   }
 
   return null;
+}
+
+function getItemKey(item) {
+  return `${item?.kind || 'event'}:${String(item?.id || '')}`;
 }
 
 function groupEvents(items) {
@@ -206,12 +183,13 @@ function groupEvents(items) {
       .toLowerCase()
       .replace(/\s+/g, ' ');
 
-    const venue = String(item.location || item.city || '')
+    const venue = String(
+      item.location || item.city || ''
+    )
       .trim()
       .toLowerCase();
 
     const key = `${title}|${venue}`;
-
     const existing = grouped.get(key);
 
     if (!existing) {
@@ -220,11 +198,10 @@ function groupEvents(items) {
         kind: 'event',
         performanceCount: 1,
       });
-
       continue;
     }
 
-    existing.performanceCount += 1;
+    const count = existing.performanceCount + 1;
 
     const currentDate = String(
       item.rawDate || item.date || ''
@@ -234,20 +211,25 @@ function groupEvents(items) {
       existing.rawDate || existing.date || ''
     );
 
+    const currentImage = getImageUrl(item);
+    const existingImage = getImageUrl(existing);
+
     if (
       currentDate &&
       (!existingDate || currentDate < existingDate)
     ) {
-      const count = existing.performanceCount;
-
       grouped.set(key, {
         ...item,
         kind: 'event',
         performanceCount: count,
+        image: currentImage || existingImage,
       });
-    } else if (!getImageUrl(existing) && getImageUrl(item)) {
-      existing.image = item.image;
-      existing.images = item.images;
+    } else {
+      existing.performanceCount = count;
+
+      if (!existingImage && currentImage) {
+        existing.image = currentImage;
+      }
     }
   }
 
@@ -259,45 +241,65 @@ function groupEvents(items) {
   });
 }
 
-function EventArtwork({ item, style }) {
+function EventArtwork({ item }) {
   const imageUrl = getImageUrl(item);
 
   const [failed, setFailed] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
-  React.useEffect(() => {
+  useEffect(() => {
     setFailed(false);
     setLoaded(false);
   }, [imageUrl]);
 
+  useEffect(() => {
+    if (__DEV__) {
+      console.log('[Community] Event artwork:', {
+        title: item?.title,
+        image: item?.image,
+        resolvedUrl: imageUrl,
+      });
+    }
+  }, [item?.title, item?.image, imageUrl]);
+
+  const showImage = !!imageUrl && !failed;
+
   return (
-    <View style={[styles.artwork, style]}>
+    <View style={styles.artwork} pointerEvents="none">
       <LinearGradient
         colors={['#30223F', '#18131F', '#101016']}
         style={StyleSheet.absoluteFillObject}
       />
 
-      {imageUrl && !failed ? (
-        <>
-          {!loaded && (
-            <ActivityIndicator
-              color={C.purple}
-              style={styles.imageLoader}
-            />
-          )}
+      {showImage ? (
+        <Image
+          key={imageUrl}
+          source={{ uri: imageUrl }}
+          style={styles.artworkImage}
+          resizeMode="cover"
+          onLoad={() => {
+            setLoaded(true);
+          }}
+          onError={(event) => {
+            console.warn(
+              '[Community] Image failed:',
+              item?.title,
+              imageUrl,
+              event?.nativeEvent?.error
+            );
 
-          <Image
-            source={{ uri: imageUrl }}
-            style={StyleSheet.absoluteFillObject}
-            resizeMode="cover"
-            onLoad={() => setLoaded(true)}
-            onError={() => setFailed(true)}
-          />
-        </>
+            setFailed(true);
+            setLoaded(false);
+          }}
+        />
       ) : (
         <View style={styles.imageFallback}>
           <Ionicons
-            name="ticket-outline"
+            name={
+              item?.kind === 'place'
+                ? 'location-outline'
+                : 'ticket-outline'
+            }
             size={42}
             color="#7C638E"
           />
@@ -308,14 +310,24 @@ function EventArtwork({ item, style }) {
         </View>
       )}
 
+      {showImage && !loaded && (
+        <View style={styles.imageLoader}>
+          <ActivityIndicator
+            color={C.purple}
+            size="small"
+          />
+        </View>
+      )}
+
       <LinearGradient
         colors={[
-          'rgba(9,9,14,0.08)',
+          'rgba(9,9,14,0.02)',
           'rgba(9,9,14,0.12)',
-          'rgba(9,9,14,0.92)',
+          'rgba(9,9,14,0.95)',
         ]}
         locations={[0, 0.4, 1]}
         style={StyleSheet.absoluteFillObject}
+        pointerEvents="none"
       />
     </View>
   );
@@ -336,16 +348,12 @@ function ExperienceCard({
         featured && styles.featuredCard,
       ]}
     >
-      <EventArtwork
-        item={item}
-        style={
-          featured
-            ? styles.featuredArtwork
-            : styles.standardArtwork
-        }
-      />
+      <EventArtwork item={item} />
 
-      <View style={styles.categoryPill}>
+      <View
+        style={styles.categoryPill}
+        pointerEvents="none"
+      >
         <Ionicons
           name={
             item.kind === 'place'
@@ -365,8 +373,15 @@ function ExperienceCard({
 
       <Pressable
         style={styles.saveButton}
-        onPress={onSave}
+        onPress={(event) => {
+          event?.stopPropagation?.();
+          onSave();
+        }}
         hitSlop={10}
+        accessibilityRole="button"
+        accessibilityLabel={
+          saved ? 'Remove from saved' : 'Save experience'
+        }
       >
         <Ionicons
           name={saved ? 'heart' : 'heart-outline'}
@@ -375,7 +390,10 @@ function ExperienceCard({
         />
       </Pressable>
 
-      <View style={styles.eventOverlay}>
+      <View
+        style={styles.eventOverlay}
+        pointerEvents="none"
+      >
         <View style={styles.dateRow}>
           <Ionicons
             name="calendar-outline"
@@ -427,11 +445,17 @@ function ExperienceCard({
   );
 }
 
-function SectionHeading({ title, subtitle, onSeeAll }) {
+function SectionHeading({
+  title,
+  subtitle,
+  onSeeAll,
+}) {
   return (
     <View style={styles.sectionHeading}>
       <View style={{ flex: 1 }}>
-        <Text style={styles.sectionTitle}>{title}</Text>
+        <Text style={styles.sectionTitle}>
+          {title}
+        </Text>
 
         {!!subtitle && (
           <Text style={styles.sectionSubtitle}>
@@ -440,12 +464,14 @@ function SectionHeading({ title, subtitle, onSeeAll }) {
         )}
       </View>
 
-      {onSeeAll && (
+      {!!onSeeAll && (
         <Pressable
           onPress={onSeeAll}
           style={styles.seeAllButton}
         >
-          <Text style={styles.seeAll}>See all</Text>
+          <Text style={styles.seeAll}>
+            See all
+          </Text>
 
           <Ionicons
             name="arrow-forward"
@@ -489,6 +515,17 @@ export default function HomeScreen({ navigation }) {
 
   const requestId = useRef(0);
   const savedRef = useRef([]);
+  const saveQueue = useRef(Promise.resolve());
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+
+    return () => {
+      mounted.current = false;
+      requestId.current += 1;
+    };
+  }, []);
 
   const groupedEvents = useMemo(
     () => groupEvents(events),
@@ -503,9 +540,17 @@ export default function HomeScreen({ navigation }) {
     [groupedEvents, places]
   );
 
+  const savedKeys = useMemo(
+    () => new Set(saved.map(getItemKey)),
+    [saved]
+  );
+
   const updateSaved = useCallback((items) => {
     savedRef.current = items;
-    setSaved(items);
+
+    if (mounted.current) {
+      setSaved(items);
+    }
   }, []);
 
   const load = useCallback(
@@ -514,6 +559,8 @@ export default function HomeScreen({ navigation }) {
 
       if (isRefresh) {
         setRefreshing(true);
+      } else {
+        setLoading(true);
       }
 
       try {
@@ -529,10 +576,18 @@ export default function HomeScreen({ navigation }) {
           AsyncStorage.getItem(FAVORITES_KEY),
         ]);
 
-        if (currentRequest !== requestId.current) return;
+        if (
+          currentRequest !== requestId.current ||
+          !mounted.current
+        ) {
+          return;
+        }
 
-        const targetCity = savedCity?.trim() || 'Johannesburg';
-        const targetCountry = savedCountry?.trim() || '';
+        const targetCity =
+          savedCity?.trim() || 'Johannesburg';
+
+        const targetCountry =
+          savedCountry?.trim() || '';
 
         setCity(targetCity);
         setCountry(targetCountry);
@@ -541,7 +596,9 @@ export default function HomeScreen({ navigation }) {
         try {
           const parsed = JSON.parse(favorites || '[]');
 
-          updateSaved(Array.isArray(parsed) ? parsed : []);
+          updateSaved(
+            Array.isArray(parsed) ? parsed : []
+          );
         } catch {
           updateSaved([]);
         }
@@ -557,68 +614,95 @@ export default function HomeScreen({ navigation }) {
           setEvents(cache.current.events);
           setPlaces(cache.current.places);
           setError('');
-          setLoading(false);
           return;
         }
 
-        if (!isRefresh) setLoading(true);
-
         setError('');
 
-        const results = await Promise.allSettled([
+        const requests = [
           getEvents({
             city: targetCity,
             country: targetCountry,
             pages: 3,
           }),
-          ...(PLACES_ENABLED
-            ? [
-                getPlaces({
-                  city: targetCity,
-                  country: targetCountry,
-                  category: 'restaurants',
-                }),
-                getPlaces({
-                  city: targetCity,
-                  country: targetCountry,
-                  category: 'activities',
-                }),
-              ]
-            : []),
-        ]);
+        ];
 
-        if (currentRequest !== requestId.current) return;
+        if (PLACES_ENABLED) {
+          requests.push(
+            getPlaces({
+              city: targetCity,
+              country: targetCountry,
+              category: 'restaurants',
+            }),
+            getPlaces({
+              city: targetCity,
+              country: targetCountry,
+              category: 'activities',
+            })
+          );
+        }
+
+        const results =
+          await Promise.allSettled(requests);
+
+        if (
+          currentRequest !== requestId.current ||
+          !mounted.current
+        ) {
+          return;
+        }
 
         const eventResult = results[0];
 
+        const eventsSucceeded =
+          eventResult.status === 'fulfilled';
+
         const nextEvents =
-          eventResult.status === 'fulfilled'
-            ? eventResult.value?.items || []
+          eventsSucceeded &&
+          Array.isArray(eventResult.value?.items)
+            ? eventResult.value.items
             : [];
 
         const nextPlaces = [];
 
         if (PLACES_ENABLED) {
           for (const result of results.slice(1)) {
-            if (result.status === 'fulfilled') {
-              nextPlaces.push(...(result.value?.items || []));
+            if (
+              result.status === 'fulfilled' &&
+              Array.isArray(result.value?.items)
+            ) {
+              nextPlaces.push(...result.value.items);
             }
           }
         }
 
         const uniquePlaces = [
           ...new Map(
-            nextPlaces.map((place) => [
-              String(place.id),
-              place,
-            ])
+            nextPlaces
+              .filter((place) => place?.id)
+              .map((place) => [
+                String(place.id),
+                place,
+              ])
           ).values(),
         ];
+
+        if (__DEV__) {
+          console.log(
+            '[Community] Events received:',
+            nextEvents.length
+          );
+
+          console.log(
+            '[Community] First event image:',
+            nextEvents[0]?.image
+          );
+        }
 
         setEvents(nextEvents);
         setPlaces(uniquePlaces);
 
-        if (eventResult.status === 'rejected') {
+        if (!eventsSucceeded) {
           setError(
             'Live events are temporarily unavailable. Pull down to retry.'
           );
@@ -631,14 +715,20 @@ export default function HomeScreen({ navigation }) {
           };
         }
       } catch (err) {
-        if (currentRequest === requestId.current) {
+        if (
+          currentRequest === requestId.current &&
+          mounted.current
+        ) {
           setError(
             err?.message ||
               'Unable to load experiences right now.'
           );
         }
       } finally {
-        if (currentRequest === requestId.current) {
+        if (
+          currentRequest === requestId.current &&
+          mounted.current
+        ) {
           setLoading(false);
           setRefreshing(false);
         }
@@ -658,42 +748,47 @@ export default function HomeScreen({ navigation }) {
   );
 
   const toggleSaved = useCallback(
-    async (item) => {
+    (item) => {
       const previous = savedRef.current;
+      const key = getItemKey(item);
 
       const exists = previous.some(
-        (entry) => String(entry.id) === String(item.id)
+        (entry) => getItemKey(entry) === key
       );
 
       const next = exists
         ? previous.filter(
-            (entry) =>
-              String(entry.id) !== String(item.id)
+            (entry) => getItemKey(entry) !== key
           )
         : [...previous, item];
 
       updateSaved(next);
 
-      try {
-        await AsyncStorage.setItem(
-          FAVORITES_KEY,
-          JSON.stringify(next)
-        );
-      } catch {
-        updateSaved(previous);
-
-        Alert.alert(
-          'Could not save',
-          'Please try again.'
-        );
-      }
+      saveQueue.current = saveQueue.current
+        .catch(() => {})
+        .then(async () => {
+          await AsyncStorage.setItem(
+            FAVORITES_KEY,
+            JSON.stringify(savedRef.current)
+          );
+        })
+        .catch(() => {
+          if (mounted.current) {
+            Alert.alert(
+              'Could not save',
+              'Please try again.'
+            );
+          }
+        });
     },
     [updateSaved]
   );
 
   const ask = useCallback(
     async (prompt) => {
-      const text = String(prompt || message).trim();
+      const text = String(
+        prompt || message
+      ).trim();
 
       if (!text || asking) return;
 
@@ -709,17 +804,23 @@ export default function HomeScreen({ navigation }) {
           candidates,
         });
 
-        setAnswer(
-          result?.answer ||
-            'I could not find a recommendation right now.'
-        );
+        if (mounted.current) {
+          setAnswer(
+            result?.answer ||
+              'I could not find a recommendation right now.'
+          );
+        }
       } catch (err) {
-        setAnswer(
-          err?.message ||
-            'Community AI is temporarily unavailable.'
-        );
+        if (mounted.current) {
+          setAnswer(
+            err?.message ||
+              'Community AI is temporarily unavailable.'
+          );
+        }
       } finally {
-        setAsking(false);
+        if (mounted.current) {
+          setAsking(false);
+        }
       }
     },
     [message, asking, city, country, candidates]
@@ -737,12 +838,13 @@ export default function HomeScreen({ navigation }) {
       ]);
 
       setCity(next);
+      setCountry('');
       setEditingCity(false);
       setAnswer('');
 
       cache.current.timestamp = 0;
 
-      load(true);
+      await load(true);
     } catch {
       Alert.alert(
         'Unable to update city',
@@ -773,17 +875,21 @@ export default function HomeScreen({ navigation }) {
         <SectionHeading
           title={title}
           subtitle={subtitle}
-          onSeeAll={() => navigation.navigate('Events')}
+          onSeeAll={() =>
+            navigation.navigate('Events')
+          }
         />
 
         <ScrollView
           horizontal
           showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.horizontalContent}
+          contentContainerStyle={
+            styles.horizontalContent
+          }
         >
           {items.slice(0, 12).map((item) => (
             <View
-              key={`${item.kind}-${item.id}`}
+              key={getItemKey(item)}
               style={{
                 width: featured
                   ? CARD_WIDTH + 16
@@ -793,9 +899,8 @@ export default function HomeScreen({ navigation }) {
               <ExperienceCard
                 item={item}
                 featured={featured}
-                saved={saved.some(
-                  (entry) =>
-                    String(entry.id) === String(item.id)
+                saved={savedKeys.has(
+                  getItemKey(item)
                 )}
                 onSave={() => toggleSaved(item)}
                 onOpen={() => openEvent(item)}
@@ -813,11 +918,12 @@ export default function HomeScreen({ navigation }) {
     )
   );
 
+  const dinnerIds = new Set(
+    dinnerPlaces.map((item) => String(item.id))
+  );
+
   const otherPlaces = places.filter(
-    (item) =>
-      !dinnerPlaces.some(
-        (place) => String(place.id) === String(item.id)
-      )
+    (item) => !dinnerIds.has(String(item.id))
   );
 
   return (
@@ -872,7 +978,9 @@ export default function HomeScreen({ navigation }) {
         </Pressable>
 
         <Pressable
-          onPress={() => navigation.navigate('Profile')}
+          onPress={() =>
+            navigation.navigate('Profile')
+          }
           style={styles.avatar}
         >
           <Text style={styles.avatarText}>
@@ -897,7 +1005,9 @@ export default function HomeScreen({ navigation }) {
           />
 
           <Pressable onPress={saveCity}>
-            <Text style={styles.applyText}>Apply</Text>
+            <Text style={styles.applyText}>
+              Apply
+            </Text>
           </Pressable>
         </View>
       )}
@@ -945,6 +1055,7 @@ export default function HomeScreen({ navigation }) {
 
             <View style={styles.aiStatus}>
               <View style={styles.aiStatusDot} />
+
               <Text style={styles.aiStatusText}>
                 AI
               </Text>
@@ -1430,7 +1541,7 @@ const styles = StyleSheet.create({
   },
 
   eventCard: {
-    height: 345,
+    height: 280,
     backgroundColor: C.card,
     borderRadius: 23,
     overflow: 'hidden',
@@ -1439,25 +1550,25 @@ const styles = StyleSheet.create({
   },
 
   featuredCard: {
-    height: 390,
+    height: 310,
   },
 
   artwork: {
     ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#201729',
+    overflow: 'hidden',
   },
 
-  standardArtwork: {
-    height: 345,
-  },
-
-  featuredArtwork: {
-    height: 390,
+  artworkImage: {
+    ...StyleSheet.absoluteFillObject,
+    width: '100%',
+    height: '100%',
   },
 
   imageLoader: {
     ...StyleSheet.absoluteFillObject,
-    alignSelf: 'center',
-    top: '40%',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
 
   imageFallback: {

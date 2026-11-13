@@ -1,8 +1,10 @@
+
 import React, {
   useState,
   useEffect,
   useCallback,
   useRef,
+  useMemo,
 } from 'react';
 
 import {
@@ -27,6 +29,15 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import {
+  getEvents,
+  apiImage,
+} from '../lib/communityApi';
+
+// ============================================================
+// THEME
+// ============================================================
+
 const COLORS = {
   background: '#09090E',
   surface: '#17171F',
@@ -37,8 +48,11 @@ const COLORS = {
   border: '#292932',
 };
 
-const API_KEY = process.env.EXPO_PUBLIC_TICKETMASTER_API_KEY;
 const CITY_KEY = '@community_selected_city';
+const COUNTRY_KEY = '@community_selected_country';
+const FAVORITES_KEY = 'favorites';
+
+const EVENT_PAGES = 5;
 
 const CATEGORIES = [
   { id: 'all', label: 'All', icon: 'apps-outline' },
@@ -51,25 +65,26 @@ const CATEGORIES = [
   { id: 'film', label: 'Film', icon: 'film-outline' },
 ];
 
-const SEGMENTS = {
-  music: 'KZFzniwnSyZfZ7v7nJ',
-  sports: 'KZFzniwnSyZfZ7v7nE',
-  arts: 'KZFzniwnSyZfZ7v7na',
-  film: 'KZFzniwnSyZfZ7v7nn',
-};
+const fallback = require('../assets/pexels-apasaric-2078008.jpg');
 
-const KEYWORDS = {
-  nightlife: 'nightlife',
-  food: 'food',
-  festivals: 'festival',
-};
+// ============================================================
+// HELPERS
+// ============================================================
 
 function formatDate(dateString, timeString) {
   if (!dateString) return 'Date to be announced';
 
-  const date = new Date(`${dateString}T12:00:00`);
+  const match = String(dateString).match(
+    /\d{4}-\d{2}-\d{2}/
+  );
 
-  if (Number.isNaN(date.getTime())) return dateString;
+  if (!match) return String(dateString);
+
+  const date = new Date(`${match[0]}T12:00:00`);
+
+  if (Number.isNaN(date.getTime())) {
+    return String(dateString);
+  }
 
   const formatted = date.toLocaleDateString('en-ZA', {
     weekday: 'short',
@@ -77,58 +92,333 @@ function formatDate(dateString, timeString) {
     month: 'short',
   });
 
-  return timeString
-    ? `${formatted} · ${timeString.slice(0, 5)}`
+  const time = timeString
+    ? String(timeString).slice(0, 5)
+    : '';
+
+  return time
+    ? `${formatted} · ${time}`
     : formatted;
 }
 
+function resolveImage(event) {
+  const candidates = [
+    event?.image,
+    event?.imageUrl,
+    event?.image_url,
+    event?.images,
+    event?.thumbnail,
+    event?._embedded?.attractions?.[0]?.images,
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+
+    const url = apiImage(candidate);
+
+    if (url) return url;
+  }
+
+  return null;
+}
+
+function normalizeText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
 function normalizeEvent(event) {
-  const venue = event._embedded?.venues?.[0];
-  const images = event.images || [];
+  const start = event?.dates?.start || {};
+  const venue = event?._embedded?.venues?.[0] || {};
 
-  const image =
-    images.find(
-      (item) =>
-        item.ratio === '16_9' &&
-        item.width >= 600
-    ) ||
-    images.find((item) => item.ratio === '16_9') ||
-    images[0];
+  const rawDate =
+    event?.rawDate ||
+    start.localDate ||
+    null;
 
-  const start = event.dates?.start || {};
+  const rawTime =
+    event?.rawTime ||
+    start.localTime ||
+    null;
+
+  const performanceDates = Array.isArray(
+    event?.performanceDates
+  )
+    ? event.performanceDates
+    : [];
+
+  const performanceCount = Math.max(
+    Number(event?.performanceCount) || 0,
+    performanceDates.length,
+    1
+  );
 
   return {
-    id: event.id,
-    title: event.name || 'Untitled event',
-    date: formatDate(start.localDate, start.localTime),
-    rawDate: start.localDate || null,
-    rawTime: start.localTime || null,
-    location: venue?.name || 'Venue to be announced',
-    city: venue?.city?.name || '',
-    address: venue?.address?.line1 || '',
-    image: image?.url || null,
+    ...event,
+
+    id: String(event.id),
+    kind: event.kind || 'event',
+
+    title:
+      event.title ||
+      event.name ||
+      'Untitled event',
+
+    rawDate,
+    rawTime,
+
+    date: formatDate(rawDate, rawTime),
+
+    location:
+      event.location ||
+      venue.name ||
+      'Venue to be announced',
+
+    city:
+      event.city ||
+      venue.city?.name ||
+      '',
+
+    address:
+      event.address ||
+      venue.address?.line1 ||
+      '',
+
+    image: resolveImage(event),
+
     description:
+      event.description ||
       event.info ||
       event.pleaseNote ||
-      event.description ||
       '',
-    url: event.url || null,
+
+    url:
+      event.url ||
+      event.ticketUrl ||
+      null,
+
     category:
-      event.classifications?.[0]?.segment?.name || '',
+      event.category ||
+      event.classifications?.[0]?.segment?.name ||
+      'Event',
+
     genre:
-      event.classifications?.[0]?.genre?.name || '',
-    priceMin: event.priceRanges?.[0]?.min ?? null,
-    priceMax: event.priceRanges?.[0]?.max ?? null,
-    currency: event.priceRanges?.[0]?.currency || null,
+      event.genre ||
+      event.classifications?.[0]?.genre?.name ||
+      '',
+
+    priceMin:
+      event.priceMin ??
+      event.priceRanges?.[0]?.min ??
+      null,
+
+    priceMax:
+      event.priceMax ??
+      event.priceRanges?.[0]?.max ??
+      null,
+
+    currency:
+      event.currency ||
+      event.priceRanges?.[0]?.currency ||
+      null,
+
+    performanceCount,
+    performanceDates,
   };
 }
 
-function EventCard({
+function duplicateKey(event) {
+  return [
+    normalizeText(event.title),
+    normalizeText(event.location),
+    normalizeText(event.city),
+  ].join('|');
+}
+
+function eventTimestamp(event) {
+  return (
+    `${event.rawDate || '9999-12-31'}T` +
+    `${event.rawTime || '23:59:59'}`
+  );
+}
+
+function normalizePerformance(performance) {
+  return {
+    id: String(performance.id || ''),
+    rawDate: performance.rawDate || null,
+    rawTime: performance.rawTime || null,
+    url: performance.url || null,
+  };
+}
+
+function performanceKey(performance) {
+  if (performance.id) {
+    return `id:${performance.id}`;
+  }
+
+  return [
+    performance.rawDate || '',
+    performance.rawTime || '',
+    performance.url || '',
+  ].join('|');
+}
+
+// ============================================================
+// DEDUPLICATION
+// ============================================================
+// Backend already groups repeated performances.
+// This is an additional safety net for overlapping results.
+// ============================================================
+
+function removeDuplicateEvents(events) {
+  const groups = new Map();
+
+  for (const event of events) {
+    const key = duplicateKey(event);
+
+    const incomingPerformances =
+      event.performanceDates?.length > 0
+        ? event.performanceDates.map(normalizePerformance)
+        : [
+            normalizePerformance({
+              id: event.id,
+              rawDate: event.rawDate,
+              rawTime: event.rawTime,
+              url: event.url,
+            }),
+          ];
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        ...event,
+        performanceDates: incomingPerformances,
+        performanceCount: Math.max(
+          event.performanceCount || 1,
+          incomingPerformances.length
+        ),
+      });
+
+      continue;
+    }
+
+    const existing = groups.get(key);
+
+    const allPerformances = [
+      ...(existing.performanceDates || []),
+      ...incomingPerformances,
+    ];
+
+    const uniquePerformances = Array.from(
+      new Map(
+        allPerformances.map((performance) => [
+          performanceKey(performance),
+          performance,
+        ])
+      ).values()
+    );
+
+    uniquePerformances.sort((a, b) => {
+      const aTime =
+        `${a.rawDate || '9999-12-31'}T` +
+        `${a.rawTime || '23:59:59'}`;
+
+      const bTime =
+        `${b.rawDate || '9999-12-31'}T` +
+        `${b.rawTime || '23:59:59'}`;
+
+      return aTime.localeCompare(bTime);
+    });
+
+    const incomingEarlier =
+      eventTimestamp(event) < eventTimestamp(existing);
+
+    const preferred = incomingEarlier
+      ? event
+      : existing;
+
+    const other = incomingEarlier
+      ? existing
+      : event;
+
+    groups.set(key, {
+      ...preferred,
+
+      image:
+        preferred.image ||
+        other.image ||
+        null,
+
+      description:
+        preferred.description ||
+        other.description ||
+        '',
+
+      url:
+        preferred.url ||
+        other.url ||
+        null,
+
+      performanceDates: uniquePerformances,
+
+      performanceCount: Math.max(
+        uniquePerformances.length,
+        existing.performanceCount || 1,
+        event.performanceCount || 1
+      ),
+    });
+  }
+
+  return Array.from(groups.values()).sort((a, b) =>
+    eventTimestamp(a).localeCompare(eventTimestamp(b))
+  );
+}
+
+function eventKey(event) {
+  return `${event?.kind || 'event'}:${String(
+    event?.id || ''
+  )}`;
+}
+
+function favoriteMatches(favorite, event) {
+  return (
+    eventKey(favorite) === eventKey(event) ||
+    (
+      favorite?.kind !== 'place' &&
+      event?.kind !== 'place' &&
+      String(favorite?.id) === String(event?.id)
+    )
+  );
+}
+
+// ============================================================
+// EVENT CARD
+// ============================================================
+
+const EventCard = React.memo(function EventCard({
   event,
   isFavorite,
   onPress,
   onFavorite,
 }) {
+  const imageUrl = resolveImage(event);
+
+  const [imageFailed, setImageFailed] = useState(false);
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [imageUrl]);
+
+  const showRemote = !!imageUrl && !imageFailed;
+
+  const performanceCount =
+    event.performanceCount || 1;
+
   return (
     <TouchableOpacity
       style={styles.eventCard}
@@ -136,21 +426,28 @@ function EventCard({
       onPress={onPress}
     >
       <View style={styles.imageContainer}>
-        {event.image ? (
-          <Image
-            source={{ uri: event.image }}
-            style={styles.eventImage}
-            resizeMode="cover"
-          />
-        ) : (
-          <View style={styles.imagePlaceholder}>
-            <Ionicons
-              name="images-outline"
-              size={34}
-              color={COLORS.muted}
-            />
-          </View>
-        )}
+        <Image
+          key={imageUrl || 'fallback'}
+          source={
+            showRemote
+              ? { uri: imageUrl }
+              : fallback
+          }
+          style={styles.eventImage}
+          resizeMode="cover"
+          onError={(error) => {
+            if (!showRemote) return;
+
+            console.warn(
+              '[Community] Explore image failed:',
+              event.title,
+              imageUrl,
+              error?.nativeEvent?.error
+            );
+
+            setImageFailed(true);
+          }}
+        />
 
         <LinearGradient
           colors={[
@@ -158,6 +455,7 @@ function EventCard({
             'rgba(0,0,0,0.55)',
           ]}
           style={StyleSheet.absoluteFillObject}
+          pointerEvents="none"
         />
 
         <TouchableOpacity
@@ -187,7 +485,7 @@ function EventCard({
         {event.category ? (
           <View style={styles.imageBadge}>
             <Text style={styles.imageBadgeText}>
-              {event.category.toUpperCase()}
+              {String(event.category).toUpperCase()}
             </Text>
           </View>
         ) : null}
@@ -204,6 +502,20 @@ function EventCard({
         >
           {event.title}
         </Text>
+
+        {performanceCount > 1 ? (
+          <View style={styles.performanceRow}>
+            <Ionicons
+              name="calendar-outline"
+              size={15}
+              color={COLORS.primary}
+            />
+
+            <Text style={styles.performanceText}>
+              {`${performanceCount} performances available`}
+            </Text>
+          </View>
+        ) : null}
 
         <View style={styles.eventLocationRow}>
           <Ionicons
@@ -225,331 +537,40 @@ function EventCard({
         {event.priceMin != null &&
         event.currency ? (
           <Text style={styles.eventPrice}>
-            From {event.currency} {event.priceMin}
+            From {event.currency}{' '}
+            {event.priceMin}
           </Text>
         ) : null}
       </View>
     </TouchableOpacity>
   );
-}
+});
 
-export default function EventsScreen({
-  navigation,
-  route,
+// ============================================================
+// STABLE SEARCH HEADER
+// ============================================================
+// Defined outside EventsScreen so keyboard focus remains stable.
+// ============================================================
+
+const ExploreHeader = React.memo(function ExploreHeader({
+  city,
+  searchText,
+  setSearchText,
+  searchMode,
+  onChangeSearchMode,
+  onSearch,
+  onClearSearch,
+  onUseMyLocation,
+  selectedCategory,
+  onSelectCategory,
+  loading,
+  resultCount,
+  searchInputRef,
+  searchRadius,
+  isPartial,
+  appliedKeyword,
 }) {
-  const insets = useSafeAreaInsets();
-
-  const [city, setCity] = useState('Johannesburg');
-  const [searchText, setSearchText] = useState('');
-  const [searchMode, setSearchMode] = useState('city');
-
-  const [selectedCategory, setSelectedCategory] =
-    useState('all');
-
-  const [coordinates, setCoordinates] = useState(null);
-  const [events, setEvents] = useState([]);
-  const [favorites, setFavorites] = useState([]);
-
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState('');
-
-  const requestId = useRef(0);
-  const searchInputRef = useRef(null);
-  const initialized = useRef(false);
-
-  const loadFavorites = useCallback(async () => {
-    try {
-      const value = await AsyncStorage.getItem(
-        'favorites'
-      );
-
-      const parsed = value
-        ? JSON.parse(value)
-        : [];
-
-      setFavorites(
-        Array.isArray(parsed) ? parsed : []
-      );
-    } catch (err) {
-      console.error('Favorites error:', err);
-      setFavorites([]);
-    }
-  }, []);
-
-  useFocusEffect(
-    useCallback(() => {
-      let active = true;
-
-      async function syncScreen() {
-        await loadFavorites();
-
-        try {
-          const savedCity =
-            await AsyncStorage.getItem(CITY_KEY);
-
-          if (!active) return;
-
-          if (!initialized.current) {
-            initialized.current = true;
-
-            if (savedCity?.trim()) {
-              setCity(savedCity.trim());
-            }
-          }
-        } catch (err) {
-          console.error('City sync error:', err);
-        }
-      }
-
-      syncScreen();
-
-      return () => {
-        active = false;
-      };
-    }, [loadFavorites])
-  );
-
-  useEffect(() => {
-    const category = route?.params?.category;
-
-    if (category) {
-      const normalized = String(category).toLowerCase();
-
-      const valid = CATEGORIES.some(
-        (item) => item.id === normalized
-      );
-
-      setSelectedCategory(
-        valid ? normalized : 'all'
-      );
-    }
-  }, [route?.params?.category]);
-
-  const fetchEvents = useCallback(
-    async (isRefresh = false) => {
-      const currentRequest = ++requestId.current;
-
-      if (!isRefresh) setLoading(true);
-      setError('');
-
-      try {
-        if (!API_KEY) {
-          throw new Error(
-            'Missing Ticketmaster API key. Check your .env file.'
-          );
-        }
-
-        const params = [
-          `apikey=${encodeURIComponent(API_KEY)}`,
-          'size=40',
-          'sort=date,asc',
-        ];
-
-        if (coordinates) {
-          params.push(
-            `latlong=${coordinates.latitude},${coordinates.longitude}`
-          );
-          params.push('radius=50');
-          params.push('unit=km');
-        } else if (city.trim()) {
-          params.push(
-            `city=${encodeURIComponent(city.trim())}`
-          );
-        }
-
-        if (SEGMENTS[selectedCategory]) {
-          params.push(
-            `segmentId=${SEGMENTS[selectedCategory]}`
-          );
-        }
-
-        if (KEYWORDS[selectedCategory]) {
-          params.push(
-            `keyword=${encodeURIComponent(
-              KEYWORDS[selectedCategory]
-            )}`
-          );
-        }
-
-        if (
-          searchMode === 'event' &&
-          searchText.trim()
-        ) {
-          params.push(
-            `keyword=${encodeURIComponent(
-              searchText.trim()
-            )}`
-          );
-        }
-
-        const url =
-          'https://app.ticketmaster.com/discovery/v2/events.json?' +
-          params.join('&');
-
-        const response = await fetch(url);
-
-        if (!response.ok) {
-          throw new Error(
-            `Ticketmaster error (${response.status})`
-          );
-        }
-
-        const data = await response.json();
-
-        if (data.errors?.length) {
-          throw new Error(
-            data.errors[0]?.detail ||
-              'Unable to load events.'
-          );
-        }
-
-        const results = (
-          data._embedded?.events || []
-        ).map(normalizeEvent);
-
-        if (currentRequest === requestId.current) {
-          setEvents(results);
-        }
-      } catch (err) {
-        console.error('Fetch events error:', err);
-
-        if (currentRequest === requestId.current) {
-          setEvents([]);
-          setError(
-            err.message || 'Unable to load events.'
-          );
-        }
-      } finally {
-        if (currentRequest === requestId.current) {
-          setLoading(false);
-          setRefreshing(false);
-        }
-      }
-    },
-    [
-      city,
-      coordinates,
-      selectedCategory,
-      searchMode,
-      searchText,
-    ]
-  );
-
-  useEffect(() => {
-    if (!initialized.current) return;
-
-    fetchEvents();
-
-    return () => {
-      requestId.current += 1;
-    };
-  }, [fetchEvents]);
-
-  const search = async () => {
-    const query = searchText.trim();
-
-    if (!query) {
-      searchInputRef.current?.focus();
-      return;
-    }
-
-    Keyboard.dismiss();
-
-    if (searchMode === 'city') {
-      setCoordinates(null);
-      setCity(query);
-      setSearchText('');
-
-      try {
-        await AsyncStorage.setItem(
-          CITY_KEY,
-          query
-        );
-      } catch (err) {
-        console.error('Save city error:', err);
-      }
-    } else {
-      fetchEvents();
-    }
-  };
-
-  const useMyLocation = async () => {
-    try {
-      const { status } =
-        await Location.requestForegroundPermissionsAsync();
-
-      if (status !== 'granted') {
-        Alert.alert(
-          'Location permission',
-          'You can still find events by searching for a city.'
-        );
-        return;
-      }
-
-      setLoading(true);
-
-      const position =
-        await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.Balanced,
-        });
-
-      setCoordinates({
-        latitude: position.coords.latitude,
-        longitude: position.coords.longitude,
-      });
-
-      setCity('Near me');
-      setSearchText('');
-      setSearchMode('city');
-    } catch (err) {
-      console.error('Location error:', err);
-
-      Alert.alert(
-        'Location unavailable',
-        'Please search by city instead.'
-      );
-
-      setLoading(false);
-    }
-  };
-
-  const toggleFavorite = async (event) => {
-    const previous = favorites;
-
-    const exists = favorites.some(
-      (item) => item.id === event.id
-    );
-
-    const updated = exists
-      ? favorites.filter(
-          (item) => item.id !== event.id
-        )
-      : [...favorites, event];
-
-    setFavorites(updated);
-
-    try {
-      await AsyncStorage.setItem(
-        'favorites',
-        JSON.stringify(updated)
-      );
-    } catch (err) {
-      setFavorites(previous);
-
-      Alert.alert(
-        'Could not save event',
-        'Please try again.'
-      );
-    }
-  };
-
-  const refreshEvents = () => {
-    setRefreshing(true);
-    fetchEvents(true);
-  };
-
-  const renderHeader = () => (
+  return (
     <View>
       <View style={styles.header}>
         <View>
@@ -564,7 +585,7 @@ export default function EventsScreen({
 
         <TouchableOpacity
           style={styles.locationButton}
-          onPress={useMyLocation}
+          onPress={onUseMyLocation}
         >
           <Ionicons
             name="location-outline"
@@ -584,6 +605,14 @@ export default function EventsScreen({
         <Text style={styles.cityText}>
           {city}
         </Text>
+
+        {searchRadius ? (
+          <View style={styles.radiusBadge}>
+            <Text style={styles.radiusText}>
+              {`${searchRadius} km area`}
+            </Text>
+          </View>
+        ) : null}
       </View>
 
       <View style={styles.searchModeRow}>
@@ -598,10 +627,7 @@ export default function EventsScreen({
               searchMode === value &&
                 styles.modeButtonActive,
             ]}
-            onPress={() => {
-              setSearchMode(value);
-              setSearchText('');
-            }}
+            onPress={() => onChangeSearchMode(value)}
           >
             <Text
               style={[
@@ -634,14 +660,16 @@ export default function EventsScreen({
           placeholderTextColor={COLORS.muted}
           value={searchText}
           onChangeText={setSearchText}
-          onSubmitEditing={search}
+          onSubmitEditing={onSearch}
           returnKeyType="search"
           autoCorrect={false}
+          autoCapitalize="none"
+          blurOnSubmit={true}
         />
 
-        {searchText ? (
+        {searchText.length > 0 || appliedKeyword ? (
           <TouchableOpacity
-            onPress={() => setSearchText('')}
+            onPress={onClearSearch}
           >
             <Ionicons
               name="close-circle"
@@ -653,7 +681,7 @@ export default function EventsScreen({
 
         <TouchableOpacity
           style={styles.searchAction}
-          onPress={search}
+          onPress={onSearch}
         >
           <Ionicons
             name="arrow-forward"
@@ -671,6 +699,7 @@ export default function EventsScreen({
 
       <ScrollView
         horizontal
+        keyboardShouldPersistTaps="always"
         showsHorizontalScrollIndicator={false}
         contentContainerStyle={styles.categoryList}
       >
@@ -687,7 +716,7 @@ export default function EventsScreen({
                   styles.categoryChipActive,
               ]}
               onPress={() =>
-                setSelectedCategory(category.id)
+                onSelectCategory(category.id)
               }
             >
               <Ionicons
@@ -716,19 +745,565 @@ export default function EventsScreen({
 
       <View style={styles.resultsHeader}>
         <Text style={styles.sectionTitle}>
-          {coordinates
-            ? 'Events near you'
+          {appliedKeyword
+            ? `Results for "${appliedKeyword}"`
             : `Events in ${city}`}
         </Text>
 
         <Text style={styles.resultsSubtitle}>
           {loading
-            ? 'Finding experiences...'
-            : `${events.length} events found`}
+            ? appliedKeyword
+              ? 'Searching live event listings...'
+              : 'Finding experiences across the city...'
+            : `${resultCount} unique events found`}
         </Text>
+
+        {!loading && isPartial ? (
+          <Text style={styles.partialText}>
+            Some event listings may be temporarily unavailable.
+          </Text>
+        ) : null}
       </View>
     </View>
   );
+});
+
+// ============================================================
+// EXPLORE SCREEN
+// ============================================================
+
+export default function EventsScreen({
+  navigation,
+  route,
+}) {
+  const insets = useSafeAreaInsets();
+
+  const [city, setCity] = useState('Johannesburg');
+  const [country, setCountry] = useState('');
+
+  const [searchText, setSearchText] = useState('');
+  const [searchMode, setSearchMode] = useState('city');
+  const [appliedKeyword, setAppliedKeyword] = useState('');
+
+  const [selectedCategory, setSelectedCategory] =
+    useState('all');
+
+  const [events, setEvents] = useState([]);
+  const [favorites, setFavorites] = useState([]);
+
+  const [initialized, setInitialized] = useState(false);
+
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState('');
+
+  const [searchRadius, setSearchRadius] = useState(null);
+  const [isPartial, setIsPartial] = useState(false);
+
+  const requestId = useRef(0);
+  const searchInputRef = useRef(null);
+  const favoritesRef = useRef([]);
+  const mutationQueue = useRef(Promise.resolve());
+
+  // ==========================================================
+  // INITIALIZE CITY
+  // ==========================================================
+
+  useEffect(() => {
+    let active = true;
+
+    async function initialize() {
+      try {
+        const values = await AsyncStorage.multiGet([
+          CITY_KEY,
+          COUNTRY_KEY,
+        ]);
+
+        if (!active) return;
+
+        const savedCity = values[0]?.[1];
+        const savedCountry = values[1]?.[1];
+
+        if (savedCity?.trim()) {
+          setCity(savedCity.trim());
+        }
+
+        if (savedCountry?.trim()) {
+          setCountry(savedCountry.trim());
+        }
+      } catch (err) {
+        console.warn(
+          '[Community] Explore initialization:',
+          err
+        );
+      } finally {
+        if (active) {
+          setInitialized(true);
+        }
+      }
+    }
+
+    initialize();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // ==========================================================
+  // FAVORITES
+  // ==========================================================
+
+  const loadFavorites = useCallback(async () => {
+    try {
+      await mutationQueue.current;
+
+      const value = await AsyncStorage.getItem(
+        FAVORITES_KEY
+      );
+
+      const parsed = value
+        ? JSON.parse(value)
+        : [];
+
+      const list = Array.isArray(parsed)
+        ? parsed
+        : [];
+
+      favoritesRef.current = list;
+      setFavorites(list);
+    } catch (err) {
+      console.warn(
+        '[Community] Favorites error:',
+        err
+      );
+    }
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      loadFavorites();
+    }, [loadFavorites])
+  );
+
+  // ==========================================================
+  // SYNC LOCATION WITH HOME
+  // ==========================================================
+
+  useFocusEffect(
+    useCallback(() => {
+      if (!initialized) return;
+
+      let active = true;
+
+      async function syncCity() {
+        try {
+          const values = await AsyncStorage.multiGet([
+            CITY_KEY,
+            COUNTRY_KEY,
+          ]);
+
+          if (!active) return;
+
+          const savedCity = values[0]?.[1];
+          const savedCountry = values[1]?.[1];
+
+          if (
+            savedCity?.trim() &&
+            savedCity.trim() !== city
+          ) {
+            setCity(savedCity.trim());
+          }
+
+          if (
+            (savedCountry || '') !== country
+          ) {
+            setCountry(savedCountry || '');
+          }
+        } catch (err) {
+          console.warn(
+            '[Community] City sync error:',
+            err
+          );
+        }
+      }
+
+      syncCity();
+
+      return () => {
+        active = false;
+      };
+    }, [initialized, city, country])
+  );
+
+  // ==========================================================
+  // CATEGORY FROM HOME
+  // ==========================================================
+
+  useEffect(() => {
+    const category = route?.params?.category;
+
+    if (!category) return;
+
+    const normalized = String(
+      category
+    ).toLowerCase();
+
+    const valid = CATEGORIES.some(
+      (item) => item.id === normalized
+    );
+
+    setSelectedCategory(
+      valid ? normalized : 'all'
+    );
+  }, [route?.params?.category]);
+
+  // ==========================================================
+  // FETCH EVENTS
+  // ==========================================================
+
+  const fetchEvents = useCallback(
+    async (isRefresh = false) => {
+      const currentRequest = ++requestId.current;
+
+      if (!isRefresh) {
+        setLoading(true);
+      }
+
+      setError('');
+
+      try {
+        // IMPORTANT:
+        // The keyword is sent to the backend.
+        // Ticketmaster searches its provider catalogue.
+        // We no longer filter only downloaded events.
+
+        const response = await getEvents({
+          city: city.trim() || 'Johannesburg',
+          country,
+          category: selectedCategory,
+          keyword: appliedKeyword.trim(),
+          pages: EVENT_PAGES,
+        });
+
+        const items = Array.isArray(response?.items)
+          ? response.items
+          : [];
+
+        const normalized = items.map(normalizeEvent);
+
+        const uniqueEvents =
+          removeDuplicateEvents(normalized);
+
+        if (currentRequest !== requestId.current) {
+          return;
+        }
+
+        setEvents(uniqueEvents);
+
+        setSearchRadius(
+          response?.searchMode === 'radius'
+            ? response?.radiusKm || null
+            : null
+        );
+
+        setIsPartial(!!response?.partial);
+
+        console.log(
+          '[Community] Live event discovery:',
+          {
+            city,
+            keyword: appliedKeyword,
+            category: selectedCategory,
+            searchMode: response?.searchMode,
+            radiusKm: response?.radiusKm,
+            providerPerformances:
+              response?.totalPerformances,
+            providerDuplicatesRemoved:
+              response?.duplicatesRemoved,
+            providerTotalElements:
+              response?.providerTotalElements,
+            pagesFetched:
+              response?.pagesFetched,
+            uniqueEvents: uniqueEvents.length,
+          }
+        );
+      } catch (err) {
+        console.error(
+          '[Community] Explore fetch error:',
+          err
+        );
+
+        if (currentRequest === requestId.current) {
+          setEvents([]);
+          setSearchRadius(null);
+          setIsPartial(false);
+
+          setError(
+            err?.message ||
+              'Unable to load events.'
+          );
+        }
+      } finally {
+        if (currentRequest === requestId.current) {
+          setLoading(false);
+          setRefreshing(false);
+        }
+      }
+    },
+    [
+      city,
+      country,
+      selectedCategory,
+      appliedKeyword,
+    ]
+  );
+
+  useEffect(() => {
+    if (!initialized) return;
+
+    fetchEvents();
+
+    return () => {
+      requestId.current += 1;
+    };
+  }, [initialized, fetchEvents]);
+
+  // ==========================================================
+  // SEARCH
+  // ==========================================================
+
+  const search = useCallback(async () => {
+    const query = searchText.trim();
+
+    if (!query) {
+      if (
+        searchMode === 'event' &&
+        appliedKeyword
+      ) {
+        setAppliedKeyword('');
+        Keyboard.dismiss();
+        return;
+      }
+
+      searchInputRef.current?.focus();
+      return;
+    }
+
+    Keyboard.dismiss();
+
+    if (searchMode === 'city') {
+      setCity(query);
+      setCountry('');
+      setSearchText('');
+      setAppliedKeyword('');
+
+      try {
+        await AsyncStorage.multiSet([
+          [CITY_KEY, query],
+          [COUNTRY_KEY, ''],
+        ]);
+      } catch (err) {
+        console.warn(
+          '[Community] Save city error:',
+          err
+        );
+      }
+    } else {
+      // Triggers a new backend request using keyword.
+      setAppliedKeyword(query);
+    }
+  }, [
+    searchText,
+    searchMode,
+    appliedKeyword,
+  ]);
+
+  const clearSearch = useCallback(() => {
+    setSearchText('');
+
+    if (searchMode === 'event') {
+      setAppliedKeyword('');
+    }
+  }, [searchMode]);
+
+  const changeSearchMode = useCallback((value) => {
+    Keyboard.dismiss();
+    setSearchMode(value);
+    setSearchText('');
+
+    if (value === 'city') {
+      setAppliedKeyword('');
+    }
+  }, []);
+
+  // ==========================================================
+  // USE MY LOCATION
+  // ==========================================================
+
+  const useMyLocation = useCallback(async () => {
+    try {
+      const { status } =
+        await Location.requestForegroundPermissionsAsync();
+
+      if (status !== 'granted') {
+        Alert.alert(
+          'Location permission',
+          'You can still find events by searching for a city.'
+        );
+
+        return;
+      }
+
+      setLoading(true);
+
+      const position =
+        await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+        });
+
+      const places =
+        await Location.reverseGeocodeAsync({
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+        });
+
+      const place = places?.[0];
+
+      const detectedCity =
+        place?.city ||
+        place?.subregion ||
+        place?.region ||
+        '';
+
+      const detectedCountry =
+        place?.isoCountryCode || '';
+
+      if (!detectedCity) {
+        throw new Error(
+          'Could not determine your city.'
+        );
+      }
+
+      const locationChanged =
+        detectedCity !== city ||
+        detectedCountry !== country ||
+        !!appliedKeyword;
+
+      setCity(detectedCity);
+      setCountry(detectedCountry);
+      setSearchText('');
+      setAppliedKeyword('');
+      setSearchMode('city');
+
+      await AsyncStorage.multiSet([
+        [CITY_KEY, detectedCity],
+        [COUNTRY_KEY, detectedCountry],
+      ]);
+
+      if (!locationChanged) {
+        setLoading(false);
+      }
+    } catch (err) {
+      console.warn(
+        '[Community] Location error:',
+        err
+      );
+
+      Alert.alert(
+        'Location unavailable',
+        'Please search by city instead.'
+      );
+
+      setLoading(false);
+    }
+  }, [city, country, appliedKeyword]);
+
+  // ==========================================================
+  // FAVORITES
+  // ==========================================================
+
+  const toggleFavorite = useCallback((event) => {
+    const previous = favoritesRef.current;
+
+    const exists = previous.some(
+      (item) => favoriteMatches(item, event)
+    );
+
+    const updated = exists
+      ? previous.filter(
+          (item) => !favoriteMatches(item, event)
+        )
+      : [...previous, event];
+
+    favoritesRef.current = updated;
+    setFavorites(updated);
+
+    const operation = mutationQueue.current
+      .catch(() => {})
+      .then(async () => {
+        const raw = await AsyncStorage.getItem(
+          FAVORITES_KEY
+        );
+
+        const parsed = raw
+          ? JSON.parse(raw)
+          : [];
+
+        const current = Array.isArray(parsed)
+          ? parsed
+          : [];
+
+        const alreadySaved = current.some(
+          (item) => favoriteMatches(item, event)
+        );
+
+        const next = alreadySaved
+          ? current.filter(
+              (item) => !favoriteMatches(item, event)
+            )
+          : [...current, event];
+
+        await AsyncStorage.setItem(
+          FAVORITES_KEY,
+          JSON.stringify(next)
+        );
+      });
+
+    mutationQueue.current = operation.catch(
+      (err) => {
+        console.error(
+          '[Community] Favorite save error:',
+          err
+        );
+
+        Alert.alert(
+          'Could not save event',
+          'Please try again.'
+        );
+
+        loadFavorites();
+      }
+    );
+  }, [loadFavorites]);
+
+  // ==========================================================
+  // REFRESH
+  // ==========================================================
+
+  const refreshEvents = useCallback(() => {
+    setRefreshing(true);
+    fetchEvents(true);
+  }, [fetchEvents]);
+
+  const savedKeys = useMemo(
+    () => new Set(favorites.map(eventKey)),
+    [favorites]
+  );
+
+  // ==========================================================
+  // EMPTY STATE
+  // ==========================================================
 
   const renderEmpty = () => {
     if (loading) {
@@ -740,7 +1315,7 @@ export default function EventsScreen({
           />
 
           <Text style={styles.emptyDescription}>
-            Finding events worth going out for...
+            Finding events across the city...
           </Text>
         </View>
       );
@@ -768,53 +1343,94 @@ export default function EventsScreen({
 
         <Text style={styles.emptyDescription}>
           {error ||
-            'Try another city, category or search term.'}
+            (
+              appliedKeyword
+                ? `No matching events found for "${appliedKeyword}" in ${city}. Try another keyword or category.`
+                : 'Try another city, category or search term.'
+            )}
         </Text>
 
         <TouchableOpacity
           style={styles.retryButton}
-          onPress={() => fetchEvents()}
+          onPress={() => {
+            if (appliedKeyword && !error) {
+              setAppliedKeyword('');
+              setSearchText('');
+            } else {
+              fetchEvents();
+            }
+          }}
         >
           <Text style={styles.retryText}>
-            Try again
+            {appliedKeyword && !error
+              ? 'Clear search'
+              : 'Try again'}
           </Text>
         </TouchableOpacity>
       </View>
     );
   };
 
+  // ==========================================================
+  // MAIN SCREEN
+  // ==========================================================
+
   return (
     <View style={styles.container}>
       <FlatList
         data={loading ? [] : events}
-        keyExtractor={(item) => String(item.id)}
+        keyExtractor={(item) => eventKey(item)}
         renderItem={({ item }) => (
           <EventCard
             event={item}
-            isFavorite={favorites.some(
-              (favorite) =>
-                favorite.id === item.id
-            )}
-            onPress={() =>
-              navigation.navigate(
-                'EventDetail',
-                { event: item }
+            isFavorite={
+              savedKeys.has(eventKey(item)) ||
+              favorites.some(
+                (favorite) =>
+                  favoriteMatches(favorite, item)
               )
+            }
+            onPress={() =>
+              navigation.navigate('EventDetail', {
+                event: item,
+              })
             }
             onFavorite={() =>
               toggleFavorite(item)
             }
           />
         )}
-        ListHeaderComponent={renderHeader}
+
+        ListHeaderComponent={
+          <ExploreHeader
+            city={city}
+            searchText={searchText}
+            setSearchText={setSearchText}
+            searchMode={searchMode}
+            onChangeSearchMode={changeSearchMode}
+            onSearch={search}
+            onClearSearch={clearSearch}
+            onUseMyLocation={useMyLocation}
+            selectedCategory={selectedCategory}
+            onSelectCategory={setSelectedCategory}
+            loading={loading}
+            resultCount={events.length}
+            searchInputRef={searchInputRef}
+            searchRadius={searchRadius}
+            isPartial={isPartial}
+            appliedKeyword={appliedKeyword}
+          />
+        }
+
         ListEmptyComponent={renderEmpty}
         showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="always"
+        keyboardDismissMode="none"
         contentContainerStyle={[
           styles.listContent,
           {
             paddingTop: insets.top + 12,
-            paddingBottom:
-              insets.bottom + 110,
+            paddingBottom: insets.bottom + 110,
           },
         ]}
         refreshControl={
@@ -828,6 +1444,10 @@ export default function EventsScreen({
     </View>
   );
 }
+
+// ============================================================
+// STYLES
+// ============================================================
 
 const styles = StyleSheet.create({
   container: {
@@ -875,6 +1495,7 @@ const styles = StyleSheet.create({
   cityRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    flexWrap: 'wrap',
     gap: 7,
     marginBottom: 20,
   },
@@ -883,6 +1504,20 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     fontSize: 15,
     fontWeight: '600',
+  },
+
+  radiusBadge: {
+    backgroundColor: '#261A35',
+    borderRadius: 8,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    marginLeft: 5,
+  },
+
+  radiusText: {
+    color: '#D8B4FE',
+    fontSize: 10,
+    fontWeight: '700',
   },
 
   searchModeRow: {
@@ -994,6 +1629,13 @@ const styles = StyleSheet.create({
     marginTop: 7,
   },
 
+  partialText: {
+    color: '#D8B4FE',
+    fontSize: 12,
+    marginTop: 7,
+    lineHeight: 18,
+  },
+
   eventCard: {
     backgroundColor: COLORS.surface,
     borderRadius: 22,
@@ -1009,12 +1651,6 @@ const styles = StyleSheet.create({
   eventImage: {
     width: '100%',
     height: '100%',
-  },
-
-  imagePlaceholder: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
   },
 
   favoriteButton: {
@@ -1066,6 +1702,19 @@ const styles = StyleSheet.create({
     letterSpacing: -0.4,
     lineHeight: 26,
     marginBottom: 10,
+  },
+
+  performanceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    marginBottom: 12,
+  },
+
+  performanceText: {
+    color: '#C99BFF',
+    fontSize: 12,
+    fontWeight: '600',
   },
 
   eventLocationRow: {

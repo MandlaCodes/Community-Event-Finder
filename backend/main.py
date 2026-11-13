@@ -568,6 +568,18 @@ def quicket_category(item):
     return "Miscellaneous"
 
 
+def normalize_external_image_url(value):
+    """Convert protocol-relative provider artwork into React Native-compatible HTTPS URLs."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if value.startswith("//"):
+        return "https:" + value
+    if value.startswith("https://") or value.startswith("http://"):
+        return value
+    return None
+
+
 def quicket_record(item, country):
     venue = item.get("venue") or {}
     locality = item.get("locality") or {}
@@ -590,7 +602,7 @@ def quicket_record(item, country):
     category_names = [c.get("name", "") for c in categories if isinstance(c, dict)]
     return {
         "id": f'quicket-{item["id"]}', "kind": "event", "provider": "quicket",
-        "title": item.get("name") or "Event", "image": item.get("imageUrl"),
+        "title": item.get("name") or "Event", "image": normalize_external_image_url(item.get("imageUrl")),
         "rawDate": performances[0]["rawDate"], "rawTime": performances[0]["rawTime"],
         "date": performances[0]["rawDate"] or "Date TBA",
         "location": venue.get("name") or "Venue TBA", "city": event_city,
