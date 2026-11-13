@@ -3,6 +3,8 @@ import asyncio
 import logging
 import re
 import time
+from datetime import datetime, timezone
+from math import asin, cos, radians, sin, sqrt
 from urllib.parse import quote
 
 import httpx
@@ -24,6 +26,8 @@ logger = logging.getLogger("community")
 
 class Settings(BaseSettings):
     ticketmaster_api_key: str = ""
+    quicket_api_key: str = ""
+    quicket_max_pages: int = 12
     google_places_api_key: str = ""
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
@@ -79,9 +83,8 @@ async def health():
 @app.get("/api/diagnostics")
 async def diagnostics():
     return {
-        "ticketmaster_configured": bool(
-            settings.ticketmaster_api_key
-        ),
+        "ticketmaster_configured": bool(settings.ticketmaster_api_key),
+        "quicket_configured": bool(settings.quicket_api_key),
         "google_places_configured": bool(
             settings.google_places_api_key
         ),
@@ -96,6 +99,8 @@ async def diagnostics():
 # ============================================================
 # CONSTANTS
 # ============================================================
+
+QUICKET_URL = "https://api.quicket.co.za/api/events"
 
 TICKETMASTER_URL = (
     "https://app.ticketmaster.com/discovery/v2/events.json"
@@ -536,6 +541,161 @@ def group_duplicate_events(events):
 
 
 # ============================================================
+# QUICKET PUBLIC EVENTS
+# ============================================================
+
+def quicket_date(value):
+    if not value:
+        return None, None
+    raw = str(value)
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.date().isoformat(), dt.strftime("%H:%M:%S")
+    except ValueError:
+        return (raw[:10] if len(raw) >= 10 else None), None
+
+
+def quicket_category(item):
+    names = " ".join(str(c.get("name", "")) for c in item.get("categories", []) if isinstance(c, dict)).lower()
+    if any(x in names for x in ("music", "concert", "festival", "gig")):
+        return "Music"
+    if any(x in names for x in ("sport", "fitness", "race")):
+        return "Sports"
+    if any(x in names for x in ("theatre", "theater", "comedy", "arts", "dance")):
+        return "Arts & Theatre"
+    if any(x in names for x in ("nightlife", "party", "club")):
+        return "Nightlife"
+    return "Miscellaneous"
+
+
+def quicket_record(item, country):
+    venue = item.get("venue") or {}
+    locality = item.get("locality") or {}
+    categories = item.get("categories") or []
+    start_date, start_time = quicket_date(item.get("startDate"))
+    schedules = item.get("schedules") or []
+    performances = []
+    for schedule in schedules:
+        if not isinstance(schedule, dict):
+            continue
+        d, t = quicket_date(schedule.get("startDate"))
+        if d:
+            performances.append({"id": f'quicket-{item["id"]}-{schedule.get("id", len(performances))}', "rawDate": d, "rawTime": t, "url": item.get("url")})
+    if not performances:
+        performances = [{"id": f'quicket-{item["id"]}', "rawDate": start_date, "rawTime": start_time, "url": item.get("url")}]
+    performances.sort(key=lambda x: (x.get("rawDate") or "9999", x.get("rawTime") or ""))
+    ticket_prices = [t.get("price") for t in (item.get("tickets") or []) if isinstance(t, dict) and isinstance(t.get("price"), (int, float))]
+    locality_values = [str(v).strip() for v in locality.values() if isinstance(v, str) and v.strip()]
+    event_city = locality.get("levelThree") or locality.get("levelTwo") or locality.get("levelOne") or ""
+    category_names = [c.get("name", "") for c in categories if isinstance(c, dict)]
+    return {
+        "id": f'quicket-{item["id"]}', "kind": "event", "provider": "quicket",
+        "title": item.get("name") or "Event", "image": item.get("imageUrl"),
+        "rawDate": performances[0]["rawDate"], "rawTime": performances[0]["rawTime"],
+        "date": performances[0]["rawDate"] or "Date TBA",
+        "location": venue.get("name") or "Venue TBA", "city": event_city,
+        "country": country or "ZA",
+        "address": ", ".join(filter(None, [venue.get("addressLine1"), venue.get("addressLine2")])),
+        "category": quicket_category(item), "genre": category_names[0] if category_names else "",
+        "description": item.get("description") or "", "url": item.get("url"),
+        "priceMin": min(ticket_prices) if ticket_prices else None,
+        "priceMax": max(ticket_prices) if ticket_prices else None,
+        "currency": "ZAR" if ticket_prices and (not country or country == "ZA") else None,
+        "latitude": venue.get("latitude"), "longitude": venue.get("longitude"),
+        "performanceCount": len(performances), "performanceDates": performances,
+    }
+
+
+def quicket_matches_city(item, city, center, radius_km):
+    venue = item.get("venue") or {}
+    locality = item.get("locality") or {}
+    fields = [str(v) for v in locality.values() if isinstance(v, str)]
+    fields.extend([str(venue.get("name") or ""), str(venue.get("addressLine1") or ""), str(venue.get("addressLine2") or "")])
+    target = normalized_text(city)
+    if target and any(target in normalized_text(f) for f in fields):
+        return True
+    if center and venue.get("latitude") is not None and venue.get("longitude") is not None:
+        try:
+            lat1, lon1 = map(radians, center)
+            lat2, lon2 = map(radians, (float(venue["latitude"]), float(venue["longitude"])))
+            a = sin((lat2-lat1)/2)**2 + cos(lat1)*cos(lat2)*sin((lon2-lon1)/2)**2
+            return 12742 * asin(min(1, sqrt(a))) <= radius_km
+        except (ValueError, TypeError):
+            pass
+    return False
+
+
+async def fetch_quicket(city, country, category, keyword, center, radius_km):
+    if not settings.quicket_api_key:
+        return {"items": [], "pagesFetched": 0, "recordsFetched": 0, "partial": False, "configured": False}
+    all_items = []
+    fetched = 0
+    partial = False
+    max_pages = max(1, min(settings.quicket_max_pages, 50))
+    for page in range(1, max_pages + 1):
+        try:
+            response = await client.get(QUICKET_URL, params={"api_key": settings.quicket_api_key, "pageSize": 100, "page": page})
+            response.raise_for_status()
+            payload = response.json()
+            batch = payload.get("results") or []
+            if not isinstance(batch, list):
+                raise ValueError("Unexpected Quicket response")
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Quicket page %s failed: %s", page, exc)
+            partial = True
+            break
+        fetched += 1
+        all_items.extend(batch)
+        total_pages = payload.get("pages")
+        if not batch or (isinstance(total_pages, int) and page >= total_pages) or len(batch) < 100:
+            break
+    else:
+        partial = True  # Global listing may contain more pages than our scan limit.
+    today = datetime.now(timezone.utc).date().isoformat()
+    results = []
+    for item in all_items:
+        if not isinstance(item, dict) or item.get("id") is None:
+            continue
+        start, _ = quicket_date(item.get("startDate"))
+        end, _ = quicket_date(item.get("endDate"))
+        if (end or start or "9999") < today:
+            continue
+        if not quicket_matches_city(item, city, center, radius_km):
+            continue
+        try:
+            event = quicket_record(item, country)
+        except (ValueError, TypeError, KeyError):
+            continue
+        if keyword and normalized_text(keyword) not in normalized_text(event["title"] + " " + event["description"]):
+            continue
+        if category not in ("", "all"):
+            cat = normalized_text(category)
+            haystack = normalized_text(event["category"] + " " + event["genre"])
+            if cat not in haystack and not (cat == "nightlife" and any(x in haystack for x in ("party", "dance", "club"))):
+                continue
+        results.append(event)
+    return {"items": results, "pagesFetched": fetched, "recordsFetched": len(all_items), "partial": partial, "configured": True}
+
+
+def merge_provider_events(ticketmaster_events, quicket_events):
+    combined = list(ticketmaster_events)
+    for event in quicket_events:
+        # Same title + venue + date indicates a likely cross-provider duplicate.
+        duplicate = next((existing for existing in combined if
+            normalized_text(existing.get("title")) == normalized_text(event.get("title")) and
+            normalized_text(existing.get("location")) == normalized_text(event.get("location")) and
+            existing.get("rawDate") == event.get("rawDate")), None)
+        if duplicate:
+            duplicate.setdefault("alternateBookingUrls", [])
+            if event.get("url") and event["url"] != duplicate.get("url"):
+                duplicate["alternateBookingUrls"].append({"provider": "quicket", "url": event["url"]})
+        else:
+            combined.append(event)
+    combined.sort(key=event_timestamp)
+    return combined
+
+
+# ============================================================
 # TICKETMASTER FETCHING
 # ============================================================
 
@@ -629,8 +789,8 @@ async def events(
     pages: int = Query(DEFAULT_EVENT_PAGES, ge=1, le=MAX_EVENT_PAGES),
     size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=100),
 ):
-    if not settings.ticketmaster_api_key:
-        raise HTTPException(503, "Ticketmaster is not configured")
+    if not settings.ticketmaster_api_key and not settings.quicket_api_key:
+        raise HTTPException(503, "No event provider is configured")
 
     city = clean_text(city)
     country = country.strip().upper()
@@ -677,8 +837,8 @@ async def events(
         searches = await asyncio.gather(*[
             fetch_search_strategy(name, params, MAX_EVENT_PAGES, size)
             for name, params in strategies
-        ])
-        if all(search["failed"] for search in searches):
+        ]) if settings.ticketmaster_api_key else []
+        if searches and all(search["failed"] for search in searches) and not settings.quicket_api_key:
             raise HTTPException(502, "Ticketmaster searches are temporarily unavailable")
 
         # IDs are the authoritative way to eliminate identical listings
@@ -698,7 +858,19 @@ async def events(
                 logger.warning("Skipping invalid Ticketmaster event: %s", exc)
 
         unique_events = group_duplicate_events(normalized)
-        partial = any(search["partial"] for search in searches)
+        # Quicket returns a global paginated feed; filter by venue city or distance.
+        center = None
+        if location_mode == "radius":
+            try:
+                # search_location returns the coordinates in location_params.
+                lat = location_params.get("latlong", "").split(",")
+                if len(lat) == 2:
+                    center = (float(lat[0]), float(lat[1]))
+            except (ValueError, TypeError):
+                pass
+        quicket = await fetch_quicket(city, effective_country, category, keyword, center, location_params.get("radius", 50))
+        unique_events = merge_provider_events(unique_events, quicket["items"])
+        partial = any(search["partial"] for search in searches) or quicket["partial"]
         stats = [
             {
                 "strategy": search["name"],
@@ -713,15 +885,18 @@ async def events(
         result = {
             "items": unique_events,
             "count": len(unique_events),
-            "source": "ticketmaster",
+            "source": "multi_provider" if quicket["configured"] else "ticketmaster",
+            "providers": {"ticketmaster": sum(e.get("provider") != "quicket" for e in unique_events), "quicket": len(quicket["items"])},
+            "quicketPagesFetched": quicket["pagesFetched"],
+            "quicketRecordsFetched": quicket["recordsFetched"],
             "partial": partial,
             "city": city,
             "country": effective_country,
             "searchMode": "radius" if len(strategies) > 1 else "city",
             "searchStrategies": [name for name, _ in strategies],
             "radiusKm": location_params.get("radius") if location_mode == "radius" else None,
-            "totalPerformances": len(normalized),
-            "duplicatesRemoved": len(normalized) - len(unique_events),
+            "totalPerformances": len(normalized) + sum(e.get("performanceCount", 1) for e in quicket["items"]),
+            "duplicatesRemoved": len(normalized) + len(quicket["items"]) - len(unique_events),
             "providerTotalElements": sum(
                 search["totalElements"] or 0 for search in searches
             ),
